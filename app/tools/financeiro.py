@@ -1,16 +1,7 @@
-import os
-from dotenv import load_dotenv
-import psycopg2
 from typing import List, Optional
 from langchain.tools import tool
 from pydantic import BaseModel, Field
-
-load_dotenv()
-
-DATABASE_URL = os.getenv("DATABASE_URL")  
-
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+from app.tools.turno_tx import escrita, leitura
 
 def _local_date_filter_sql(coluna: str) -> str:
     """Filtra uma coluna timestamptz pela data local (America/Sao_Paulo)."""
@@ -178,58 +169,50 @@ def add_transaction(
     payment_method: Optional[str] = None,
 ) -> dict:
     """Insere uma transação financeira no banco de dados Postgres.""" # docstring obrigatório da @tools do langchain (estranho, mas legal né?)
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        resolved_type_id = _resolve_type_id(cur, type_id, type_name)
-        resolved_category_id = _resolve_category_name(cur, category_id, category_name)
-        
-        amount = float(amount)
     
-        if not resolved_type_id:
-            return {"status": "error", "message": "Tipo inválido (use type_id ou type_name: INCOME/EXPENSES/TRANSFER)."}
-        
-        if not resolved_category_id:
-            return {"status": "error", "message": "Categoria inválida"}
+    
+    try:
+        with escrita() as cur:
+            resolved_type_id = _resolve_type_id(cur, type_id, type_name)
+            resolved_category_id = _resolve_category_name(cur, category_id, category_name)
 
-        if occurred_at:
-            cur.execute(
-                """
-                INSERT INTO transactions
-                    (amount, type, category_id, description, payment_method, occurred_at, source_text)
-                VALUES
-                    (%s, %s, %s, %s, %s, %s::timestamptz, %s)
-                RETURNING id, occurred_at;
-                """,
-                (amount, resolved_type_id, resolved_category_id, description, payment_method, occurred_at, source_text),
-            )
-        else:
-            cur.execute(
-                """
-                INSERT INTO transactions
-                    (amount, type, category_id, description, payment_method, occurred_at, source_text)
-                VALUES
-                    (%s, %s, %s, %s, %s, NOW(), %s)
-                RETURNING id, occurred_at;
-                """,
-                (amount, resolved_type_id, resolved_category_id, description, payment_method, source_text),
-            )
+            amount = float(amount)
 
-        new_id, occurred = cur.fetchone()
-        conn.commit()
+            if not resolved_type_id:
+                return {"status": "error", "message": "Tipo inválido (use type_id ou type_name: INCOME/EXPENSES/TRANSFER)."}
+
+            if not resolved_category_id:
+                return {"status": "error", "message": "Categoria inválida"}
+
+            if occurred_at:
+                cur.execute(
+                    """
+                    INSERT INTO transactions
+                        (amount, type, category_id, description, payment_method, occurred_at, source_text)
+                    VALUES
+                        (%s, %s, %s, %s, %s, %s::timestamptz, %s)
+                    RETURNING id, occurred_at;
+                    """,
+                    (amount, resolved_type_id, resolved_category_id, description, payment_method, occurred_at, source_text),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO transactions
+                        (amount, type, category_id, description, payment_method, occurred_at, source_text)
+                    VALUES
+                        (%s, %s, %s, %s, %s, NOW(), %s)
+                    RETURNING id, occurred_at;
+                    """,
+                    (amount, resolved_type_id, resolved_category_id, description, payment_method, source_text),
+                )
+
+            new_id, occurred = cur.fetchone()
         return {"status": "ok", "id": new_id, "occurred_at": str(occurred)}
 
     except Exception as e:
-        conn.rollback()
-        print("ERRO REAL:", e)  # 👈 MUITO IMPORTANTE
-        raise e  # 👈 deixa o erro explodir de verdade
-        return {"status": "error", "message": str(e)}
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
+        print("ERRO REAL:", e)
+        raise e
 
 
 @tool("query_transactions", args_schema=QueryTransactionsArgs)
@@ -240,8 +223,8 @@ def query_transactions(
     final_date: Optional[str] = None) -> dict:
     """Lista transações entre duas datas."""
     
-    conn = get_conn()
-    cur = conn.cursor()
+    
+    
     query = """SELECT source_text, amount, occurred_at, categories.name FROM transactions 
                 JOIN categories ON category_id = categories.id"""
     params = []
@@ -268,9 +251,9 @@ def query_transactions(
                 params.append(initial_date)
             query += " ORDER BY occurred_at DESC"
 
-        cur.execute(query, params)
-        rows = cur.fetchall()
-        
+        with leitura() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
 
         return {
             "status": "ok",
@@ -278,43 +261,31 @@ def query_transactions(
         }
     
     except Exception as e:
-        conn.rollback()
         return {"status": "error", "message": str(e)}
-    
-    finally:
-        cur.close()
-        conn.close()
         
 # TOOL para buscar o balanço diário das transações
 @tool("daily_balance")
 def daily_balance() -> dict:
     """Mostra o balanço diário de transações."""
-    
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute(""" 
-            SELECT 
-                SUM(CASE WHEN type = 1 THEN amount ELSE -amount END) as balance
-            FROM transactions
-            WHERE (occurred_at AT TIME ZONE 'America/Sao_Paulo')::date = CURRENT_DATE
-            GROUP BY DATE(occurred_at);
-        """)
 
-        rows = cur.fetchall()
+    try:
+        with leitura() as cur:
+            cur.execute("""
+                SELECT
+                    SUM(CASE WHEN type = 1 THEN amount ELSE -amount END) as balance
+                FROM transactions
+                WHERE (occurred_at AT TIME ZONE 'America/Sao_Paulo')::date = CURRENT_DATE
+                GROUP BY DATE(occurred_at);
+            """)
+            rows = cur.fetchall()
 
         return {
             "status": "ok",
             "transactions": rows
         }
-    
+
     except Exception as e:
-        conn.rollback()
         return {"status": "error", "message": str(e)}
-    
-    finally:
-        cur.close()
-        conn.close()    
 
 
 # TOOL para buscar o balanço diário das transações
@@ -322,30 +293,20 @@ def daily_balance() -> dict:
 def total_balance() -> dict:
     """Mostra o balanço total de transações, do começo ao fim."""
     
-    conn = get_conn()
-    cur = conn.cursor()
     try:
-        cur.execute(""" 
-            SELECT 
-                SUM(CASE WHEN ts.type = 1 THEN ts.amount ELSE -ts.amount END) 
-            FROM transactions ts 
-            WHERE ts.type != 3;
-        """)
+        with leitura() as cur:
+            cur.execute("""
+                SELECT
+                    SUM(CASE WHEN ts.type = 1 THEN ts.amount ELSE -ts.amount END)
+                FROM transactions ts
+                WHERE ts.type != 3;
+            """)
+            rows = cur.fetchall()
 
-        rows = cur.fetchall()
+        return {"status": "ok", "transactions": rows}
 
-        return {
-            "status": "ok",
-            "transactions": rows
-        }
-    
     except Exception as e:
-        conn.rollback()
         return {"status": "error", "message": str(e)}
-    
-    finally:
-        cur.close()
-        conn.close()    
         
 
 @tool("update_transaction", args_schema=UpdateTransactionArgs)
@@ -373,86 +334,77 @@ def update_transaction(
     if not any([amount, type_id, type_name, category_id, category_name, description, payment_method, occurred_at]):
         return {"status": "error", "message": "Nada para atualizar: forneça pelo menos um campo (amount, type, category, description, payment_method, occurred_at)."}
 
-    conn = get_conn()
-    cur = conn.cursor()
     try:
-        # Resolve target_id
-        target_id = id
-        if target_id is None:
-            if not match_text or not date_local:
-                return {"status": "error", "message": "Sem 'id': informe match_text E date_local para localizar o registro."}
+        with escrita() as cur:
+            target_id = id
+            if target_id is None:
+                if not match_text or not date_local:
+                    return {"status": "error", "message": "Sem 'id': informe match_text E date_local para localizar o registro."}
 
-            # Buscar o mais recente no dia local informado que combine o texto
+                cur.execute(
+                    f"""
+                    SELECT t.id
+                    FROM transactions t
+                    WHERE (t.source_text ILIKE %s OR t.description ILIKE %s)
+                      AND {_local_date_filter_sql("t.occurred_at")}
+                    ORDER BY t.occurred_at DESC
+                    LIMIT 1;
+                    """,
+                    (f"%{match_text}%", f"%{match_text}%", date_local)
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {"status": "error", "message": "Nenhuma transação encontrada para os filtros fornecidos."}
+                target_id = row[0]
+
+            resolved_type_id = _resolve_type_id(cur, type_id, type_name) if (type_id or type_name) else None
+            resolved_category_id = category_id
+            if category_name and not category_id:
+                resolved_category_id = _resolve_category_name(cur, None, category_name)
+
+            sets = []
+            params: List[object] = []
+            if amount is not None:
+                sets.append("amount = %s")
+                params.append(amount)
+            if resolved_type_id is not None:
+                sets.append("type = %s")
+                params.append(resolved_type_id)
+            if resolved_category_id is not None:
+                sets.append("category_id = %s")
+                params.append(resolved_category_id)
+            if description is not None:
+                sets.append("description = %s")
+                params.append(description)
+            if payment_method is not None:
+                sets.append("payment_method = %s")
+                params.append(payment_method)
+            if occurred_at is not None:
+                sets.append("occurred_at = %s::timestamptz")
+                params.append(occurred_at)
+
+            if not sets:
+                return {"status": "error", "message": "Nenhum campo válido para atualizar."}
+
+            params.append(target_id)
+
+            cur.execute(f"UPDATE transactions SET {', '.join(sets)} WHERE id = %s;", params)
+            rows_affected = cur.rowcount
+
             cur.execute(
-                f"""
-                SELECT t.id
+                """
+                SELECT
+                  t.id, t.occurred_at, t.amount, tt.type AS type_name,
+                  c.name AS category_name, t.description, t.payment_method, t.source_text
                 FROM transactions t
-                WHERE (t.source_text ILIKE %s OR t.description ILIKE %s)
-                  AND {_local_date_filter_sql("t.occurred_at")}
-                ORDER BY t.occurred_at DESC
-                LIMIT 1;
+                JOIN transaction_types tt ON tt.id = t.type
+                LEFT JOIN categories c ON c.id = t.category_id
+                WHERE t.id = %s;
                 """,
-                (f"%{match_text}%", f"%{match_text}%", date_local)
+                (target_id,)
             )
-            row = cur.fetchone()
-            if not row:
-                return {"status": "error", "message": "Nenhuma transação encontrada para os filtros fornecidos."}
-            target_id = row[0]
+            r = cur.fetchone()
 
-        # Resolver type_id / category_id a partir de nomes, se fornecidos
-        resolved_type_id = _resolve_type_id(cur, type_id, type_name) if (type_id or type_name) else None
-        resolved_category_id = category_id
-        if category_name and not category_id:
-            resolved_category_id = _resolve_category_name(cur, None, category_name)
-
-        # Montar SET dinâmico
-        sets = []
-        params: List[object] = []
-        if amount is not None:
-            sets.append("amount = %s")
-            params.append(amount)
-        if resolved_type_id is not None:
-            sets.append("type = %s")
-            params.append(resolved_type_id)
-        if resolved_category_id is not None:
-            sets.append("category_id = %s")
-            params.append(resolved_category_id)
-        if description is not None:
-            sets.append("description = %s")
-            params.append(description)
-        if payment_method is not None:
-            sets.append("payment_method = %s")
-            params.append(payment_method)
-        if occurred_at is not None:
-            sets.append("occurred_at = %s::timestamptz")
-            params.append(occurred_at)
-
-        if not sets:
-            return {"status": "error", "message": "Nenhum campo válido para atualizar."}
-
-        params.append(target_id)
-
-        cur.execute(
-            f"UPDATE transactions SET {', '.join(sets)} WHERE id = %s;",
-            params
-        )
-        rows_affected = cur.rowcount
-        conn.commit()
-
-        # Retornar o registro atualizado
-        cur.execute(
-            """
-            SELECT
-              t.id, t.occurred_at, t.amount, tt.type AS type_name,
-              c.name AS category_name, t.description, t.payment_method, t.source_text
-            FROM transactions t
-            JOIN transaction_types tt ON tt.id = t.type
-            LEFT JOIN categories c ON c.id = t.category_id
-            WHERE t.id = %s;
-            """,
-            (target_id,)
-        )
-        r = cur.fetchone()
         updated = None
         if r:
             updated = {
@@ -466,22 +418,10 @@ def update_transaction(
                 "source_text": r[7],
             }
 
-        return {
-            "status": "ok",
-            "rows_affected": rows_affected,
-            "id": target_id,
-            "updated": updated
-        }
+        return {"status": "ok", "rows_affected": rows_affected, "id": target_id, "updated": updated}
 
     except Exception as e:
-        conn.rollback()
         return {"status": "error", "message": str(e)}
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
 
 # Exporta a lista de tools
 TOOLS = [add_transaction, query_transactions, daily_balance, total_balance, update_transaction]

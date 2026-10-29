@@ -1,14 +1,7 @@
-import psycopg2
 from typing import List, Optional
 from langchain.tools import tool
 from pydantic import BaseModel, Field
-
-from app.config import DATABASE_URL
-
-
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
-
+from app.tools.turno_tx import escrita, leitura
 
 # ==============================================================================
 # ARGS SCHEMAS
@@ -103,21 +96,19 @@ def add_event(
     notes: Optional[str] = None,
 ) -> dict:
     """Insere um compromisso/evento no banco de dados Postgres (tabela events)."""
-    conn = get_conn()
-    cur = conn.cursor()
     try:
-        cur.execute(
-            """
-            INSERT INTO events
-                (title, start_time, end_time, location, notes, source_text, recorded_at)
-            VALUES
-                (%s, %s::timestamptz, %s::timestamptz, %s, %s, %s, NOW())
-            RETURNING id, start_time, end_time;
-            """,
-            (title, start_time, end_time, location, notes, source_text),
-        )
-        new_id, started, ended = cur.fetchone()
-        conn.commit()
+        with escrita() as cur:
+            cur.execute(
+                """
+                INSERT INTO events
+                    (title, start_time, end_time, location, notes, source_text, recorded_at)
+                VALUES
+                    (%s, %s::timestamptz, %s::timestamptz, %s, %s, %s, NOW())
+                RETURNING id, start_time, end_time;
+                """,
+                (title, start_time, end_time, location, notes, source_text),
+            )
+            new_id, started, ended = cur.fetchone()
         return {
             "status": "ok",
             "id": new_id,
@@ -125,15 +116,7 @@ def add_event(
             "end_time": str(ended) if ended else None,
         }
     except Exception as e:
-        conn.rollback()
         return {"status": "error", "message": str(e)}
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
-
 
 # ==============================================================================
 # TOOL: query_events
@@ -146,8 +129,6 @@ def query_events(
     final_date: Optional[str] = None,
 ) -> dict:
     """Lista compromissos/eventos, opcionalmente filtrando por texto, título ou período."""
-    conn = get_conn()
-    cur = conn.cursor()
     query = "SELECT id, title, start_time, end_time, location, notes, source_text FROM events WHERE 1=1"
     params: List[object] = []
 
@@ -170,8 +151,9 @@ def query_events(
 
         query += " ORDER BY start_time ASC"
 
-        cur.execute(query, params)
-        rows = cur.fetchall()
+        with leitura() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
 
         return {
             "status": "ok",
@@ -189,11 +171,7 @@ def query_events(
             ],
         }
     except Exception as e:
-        conn.rollback()
         return {"status": "error", "message": str(e)}
-    finally:
-        cur.close()
-        conn.close()
 
 
 # ==============================================================================
@@ -206,8 +184,6 @@ def check_conflicts(
     exclude_id: Optional[int] = None,
 ) -> dict:
     """Verifica se já existe algum evento que se sobreponha à janela de horário informada."""
-    conn = get_conn()
-    cur = conn.cursor()
     try:
         end_value = end_time or start_time
         query = """
@@ -224,8 +200,9 @@ def check_conflicts(
 
         query += " ORDER BY start_time ASC"
 
-        cur.execute(query, params)
-        rows = cur.fetchall()
+        with leitura() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
 
         return {
             "status": "ok",
@@ -242,11 +219,7 @@ def check_conflicts(
             ],
         }
     except Exception as e:
-        conn.rollback()
         return {"status": "error", "message": str(e)}
-    finally:
-        cur.close()
-        conn.close()
 
 
 def _resolve_target_id(cur, id: Optional[int], match_text: Optional[str], date_local: Optional[str]):
@@ -297,42 +270,41 @@ def update_event(
     if not any([title, start_time, end_time, location, notes]):
         return {"status": "error", "message": "Nada para atualizar: forneça pelo menos um campo."}
 
-    conn = get_conn()
-    cur = conn.cursor()
     try:
-        target_id, erro = _resolve_target_id(cur, id, match_text, date_local)
-        if erro:
-            return {"status": "error", "message": erro}
+        with escrita() as cur:
+            target_id, erro = _resolve_target_id(cur, id, match_text, date_local)
+            if erro:
+                return {"status": "error", "message": erro}
 
-        sets = []
-        params: List[object] = []
-        if title is not None:
-            sets.append("title = %s")
-            params.append(title)
-        if start_time is not None:
-            sets.append("start_time = %s::timestamptz")
-            params.append(start_time)
-        if end_time is not None:
-            sets.append("end_time = %s::timestamptz")
-            params.append(end_time)
-        if location is not None:
-            sets.append("location = %s")
-            params.append(location)
-        if notes is not None:
-            sets.append("notes = %s")
-            params.append(notes)
+            sets = []
+            params: List[object] = []
+            if title is not None:
+                sets.append("title = %s")
+                params.append(title)
+            if start_time is not None:
+                sets.append("start_time = %s::timestamptz")
+                params.append(start_time)
+            if end_time is not None:
+                sets.append("end_time = %s::timestamptz")
+                params.append(end_time)
+            if location is not None:
+                sets.append("location = %s")
+                params.append(location)
+            if notes is not None:
+                sets.append("notes = %s")
+                params.append(notes)
 
-        params.append(target_id)
+            params.append(target_id)
 
-        cur.execute(f"UPDATE events SET {', '.join(sets)} WHERE id = %s;", params)
-        rows_affected = cur.rowcount
-        conn.commit()
+            cur.execute(f"UPDATE events SET {', '.join(sets)} WHERE id = %s;", params)
+            rows_affected = cur.rowcount
 
-        cur.execute(
-            "SELECT id, title, start_time, end_time, location, notes, source_text FROM events WHERE id = %s;",
-            (target_id,),
-        )
-        r = cur.fetchone()
+            cur.execute(
+                "SELECT id, title, start_time, end_time, location, notes, source_text FROM events WHERE id = %s;",
+                (target_id,),
+            )
+            r = cur.fetchone()
+
         updated = None
         if r:
             updated = {
@@ -347,14 +319,7 @@ def update_event(
 
         return {"status": "ok", "rows_affected": rows_affected, "id": target_id, "updated": updated}
     except Exception as e:
-        conn.rollback()
         return {"status": "error", "message": str(e)}
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
 
 
 # ==============================================================================
@@ -374,19 +339,17 @@ def delete_event(
         title/notes/source_text) E (date_local em America/Sao_Paulo), então remove.
     Sempre confirme com o usuário antes de chamar esta tool.
     """
-    conn = get_conn()
-    cur = conn.cursor()
     try:
-        target_id, erro = _resolve_target_id(cur, id, match_text, date_local)
-        if erro:
-            return {"status": "error", "message": erro}
+        with escrita() as cur:
+            target_id, erro = _resolve_target_id(cur, id, match_text, date_local)
+            if erro:
+                return {"status": "error", "message": erro}
 
-        cur.execute("SELECT id, title, start_time FROM events WHERE id = %s;", (target_id,))
-        removido = cur.fetchone()
+            cur.execute("SELECT id, title, start_time FROM events WHERE id = %s;", (target_id,))
+            removido = cur.fetchone()
 
-        cur.execute("DELETE FROM events WHERE id = %s;", (target_id,))
-        rows_affected = cur.rowcount
-        conn.commit()
+            cur.execute("DELETE FROM events WHERE id = %s;", (target_id,))
+            rows_affected = cur.rowcount
 
         return {
             "status": "ok",
@@ -397,14 +360,7 @@ def delete_event(
             else None,
         }
     except Exception as e:
-        conn.rollback()
         return {"status": "error", "message": str(e)}
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except Exception:
-            pass
 
 
 # Exporta a lista de tools

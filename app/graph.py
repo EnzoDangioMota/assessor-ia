@@ -37,6 +37,7 @@ from langchain_core.runnables import RunnableConfig
 
 from app.memory import iniciar_sessao, salvar_mensagem, encerrar_sessao
 from app.observabilidade import abrir_turno, coletor, fechar_turno, status_do_estado
+from app.tools.turno_tx import iniciar_turno, encerrar_turno
 
 data_atual = datetime.now()
 
@@ -356,6 +357,7 @@ def executar_fluxo_assessor(
     }
 
     turno_id = abrir_turno()
+    iniciar_turno()  # unidade de trabalho do turno: o juiz decide o commit (app/juiz.py)
     status = "erro"
     rota = ""
     try:
@@ -379,6 +381,7 @@ def executar_fluxo_assessor(
         rota = estado_final.get("rota") or ""
         return resposta
     finally:
+        encerrar_turno()  # rede de segurança: desfaz o que o juiz não confirmou (exceção, bloqueio)
         fechar_turno(turno_id, session_id=session_id, rota=rota, status=status)
 
 # while True: 

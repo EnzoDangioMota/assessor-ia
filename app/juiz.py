@@ -5,11 +5,16 @@ import urllib.request
 from typing import Any
 
 from app.config import TYPESAFE_API_KEY
+from app.tools.turno_tx import turno_atual
 
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
 JEV_MODELO = "jev-latest"
 LIMIAR = 0.70
 FRASE_SEGURA = "Não tenho evidência para afirmar isso."
+# Quando o turno tinha escrita e o juiz recusou (ou não respondeu): a frase diz que nada foi salvo.
+FRASE_ESCRITA_DESFEITA = "Não consegui confirmar essa operação, então não salvei nada. Pode reformular o pedido?"
+# Quando o juiz aprovou mas o COMMIT falhou: a frase aprovada seria falsa.
+FRASE_COMMIT_FALHOU = "Não consegui salvar essa operação. Nada foi gravado. Tente novamente."
 
 REGRAS = (
     "A pergunta do usuário é evidência do que ele disse que fez, não de fatos sobre o mundo. "
@@ -79,8 +84,25 @@ def _coleta(estado: dict[str, Any]) -> tuple[str, str, str]:
         evidencia = "(nenhuma tool devolveu conteúdo neste turno)"
     return pergunta, resposta, evidencia[-6000:]
 
+def _encerrar_escrita(aprovado: bool) -> bool:
+    """Fronteira do turno: só aqui as escritas das tools são confirmadas ou desfeitas.
 
-def _publicar(texto: str, rotulo: str, resposta_original: str) -> dict[str, Any]:
+    Devolve False se o COMMIT falhou (a escrita foi desfeita).
+    """
+    turno = turno_atual()
+    if turno is None:
+        return True
+    try:
+        turno.finalizar(aprovado)
+        return True
+    except Exception as exc:
+        print(f"[juiz] commit falhou, escrita desfeita: {exc}")
+        return False
+
+
+def _publicar(texto: str, rotulo: str, resposta_original: str, aprovado: bool = False) -> dict[str, Any]:
+    if not _encerrar_escrita(aprovado):
+        texto, rotulo = FRASE_COMMIT_FALHOU, f"{rotulo}+commit_falhou"
     print(f"[juiz] {rotulo}")
     if texto == resposta_original:
         return {"agentes_chamados": [f"juiz:{rotulo}"]}
@@ -91,15 +113,18 @@ def _publicar(texto: str, rotulo: str, resposta_original: str) -> dict[str, Any]
 
 
 def _reprovar(resposta: str, rotulo: str) -> dict[str, Any]:
-    return _publicar(FRASE_SEGURA, rotulo, resposta)
+    turno = turno_atual()
+    frase = FRASE_ESCRITA_DESFEITA if (turno is not None and turno.escreveu) else FRASE_SEGURA
+    return _publicar(frase, rotulo, resposta, aprovado=False)
 
 
 def no_juiz(estado: dict[str, Any]) -> dict[str, Any]:
     pergunta, resposta, evidencia = _coleta(estado)
     if not resposta:
+        _encerrar_escrita(False)  # sem frase para julgar: nada é confirmado
         return {"agentes_chamados": ["juiz:sem_resposta"]}
     if not TYPESAFE_API_KEY:
-        return _reprovar(resposta, "sem_chave")
+        return _reprovar(resposta, "sem_chave")    
 
     corpo = json.dumps({
         "model": JEV_MODELO,
@@ -159,6 +184,6 @@ def no_juiz(estado: dict[str, Any]) -> dict[str, Any]:
         return _reprovar(resposta, "resposta inválida")
 
     if choice == "apoiada" and noul >= LIMIAR:
-        return _publicar(resposta, f"apoiada noul={noul:.2f}", resposta)
+        return _publicar(resposta, f"apoiada noul={noul:.2f}", resposta, aprovado=True)
     rotulo = "apoiada:abaixo_do_limiar" if choice == "apoiada" else choice
     return _reprovar(resposta, f"{rotulo} noul={noul:.2f}")
