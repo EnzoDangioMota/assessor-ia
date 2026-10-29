@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 import psycopg2
-from typing import Optional
+from typing import List, Optional
 from langchain.tools import tool
 from pydantic import BaseModel, Field
 
@@ -11,6 +11,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
+
+def _local_date_filter_sql(coluna: str) -> str:
+    """Filtra uma coluna timestamptz pela data local (America/Sao_Paulo)."""
+    return f"({coluna} AT TIME ZONE 'America/Sao_Paulo')::date = %s::date"
 
 # Essa classe garante que o objeto de Python passe todos esses campos
 class AddTransactionArgs(BaseModel):
@@ -399,7 +403,7 @@ def update_transaction(
         resolved_type_id = _resolve_type_id(cur, type_id, type_name) if (type_id or type_name) else None
         resolved_category_id = category_id
         if category_name and not category_id:
-            resolved_category_id = _resolve_category_name(cur, category_name)
+            resolved_category_id = _resolve_category_name(cur, None, category_name)
 
         # Montar SET dinâmico
         sets = []
@@ -480,4 +484,4 @@ def update_transaction(
             pass
 
 # Exporta a lista de tools
-TOOLS = [add_transaction, query_transactions, daily_balance, total_balance]
+TOOLS = [add_transaction, query_transactions, daily_balance, total_balance, update_transaction]
