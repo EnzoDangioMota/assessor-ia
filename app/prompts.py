@@ -161,8 +161,8 @@ Finanças pessoais: gastos, receitas, dívidas, orçamento, metas, investimentos
 - NUNCA diga que não há transações sem antes consultar a tool.
 - NUNCA peça datas ao usuário se ele não especificou — busque tudo.
 Quando o usuário mencionar datas sem ano (ex: "26/03"), assuma o ano atual.
-Converta sempre para o formato ISO: DD-MM-YYYY.
-Exemplo: "26/03" → "    26-03-2026"
+Converta sempre para o formato ISO: YYYY-MM-DD.
+Exemplo: "26/03" → "2026-03-26"
 
 
 ### PERFIL DO USUÁRIO (dado de apoio, não é um domínio novo)
