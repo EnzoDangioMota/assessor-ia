@@ -1,0 +1,162 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Em PR, uma execucao nova cancela a anterior. Em push na main nunca cancela,
+# para nao interromper um deploy no meio.
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # CI: roda em push e em pull_request para a main
+  # ---------------------------------------------------------------------------
+  ci:
+    name: CI - testes e build da imagem
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout do projeto
+        uses: actions/checkout@v6
+
+      - name: Configurar Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Os testes usam mocks: nao precisam de banco, de chaves nem de rede.
+      - name: Executar testes (unittest)
+        run: python -m unittest discover -s tests -v
+
+      - name: Construir a imagem Docker
+        run: docker build -t assessor-ia:ci .
+
+      # Sobe o mesmo container que ira para producao, com valores FALSOS
+      # (nenhum segredo real na CI), e confere o /health.
+      - name: Smoke test do container
+        run: |
+          docker run -d --name assessor -p 8000:10000 \
+            -e GEMINI_API_KEY=ci-fake \
+            -e GROQ_API_KEY=ci-fake \
+            -e DATABASE_URL=postgresql://ci:ci@localhost:5432/ci \
+            -e MONGODB_URI=mongodb://localhost:27017 \
+            -e QDRANT_URL=http://localhost:6333 \
+            assessor-ia:ci
+          for i in $(seq 1 30); do
+            CORPO=$(curl -fsS http://localhost:8000/health || true)
+            if echo "$CORPO" | jq -e '.status == "ok"' >/dev/null 2>&1; then
+              echo "Container saudavel: $CORPO"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "O container nao ficou saudavel."
+          exit 1
+
+      - name: Logs do container (em caso de falha)
+        if: failure()
+        run: docker logs assessor || true
+
+  # ---------------------------------------------------------------------------
+  # CD: so em push na main e so se a CI passou (needs: ci)
+  # ---------------------------------------------------------------------------
+  cd:
+    name: CD - deploy no Render
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    # Os secrets e variaveis deste ambiente so ficam disponiveis para jobs que o declaram.
+    environment:
+      name: Assessor-env
+      url: ${{ vars.APP_URL }}
+
+    concurrency:
+      group: deploy-producao
+      cancel-in-progress: false
+
+    steps:
+      - name: Disparar deploy do commit validado
+        id: deploy
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "Secret RENDER_DEPLOY_HOOK_URL nao configurado."; exit 1
+          fi
+          # ref = SHA exato que passou na CI
+          RESPOSTA=$(curl -sS -X POST -w '\n%{http_code}' "${RENDER_DEPLOY_HOOK_URL}&ref=${GITHUB_SHA}")
+          CODIGO=$(echo "$RESPOSTA" | tail -n1)
+          CORPO=$(echo "$RESPOSTA" | sed '$d')
+          echo "HTTP $CODIGO"
+          if [ "$CODIGO" != "200" ]; then
+            echo "O Render nao iniciou um novo deploy (esperado HTTP 200). Corpo: $CORPO"
+            exit 1
+          fi
+          DEPLOY_ID=$(echo "$CORPO" | jq -r '.deploy.id')
+          SERVICE_ID=$(echo "$RENDER_DEPLOY_HOOK_URL" | sed -E 's#.*/deploy/(srv-[^?/]+).*#\1#')
+          echo "deploy_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
+          echo "service_id=$SERVICE_ID" >> "$GITHUB_OUTPUT"
+          echo "Deploy $DEPLOY_ID iniciado para o commit $GITHUB_SHA"
+
+      # O Render mantem a versao antiga no ar se o build novo falhar; por isso
+      # esperamos o status deste deploy, e nao apenas uma resposta do /health.
+      - name: Aguardar o deploy ficar "live"
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          DEPLOY_ID: ${{ steps.deploy.outputs.deploy_id }}
+          SERVICE_ID: ${{ steps.deploy.outputs.service_id }}
+        run: |
+          for i in $(seq 1 90); do
+            RESP=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/services/$SERVICE_ID/deploys/$DEPLOY_ID") || RESP=$'\n000'
+            CODIGO=$(echo "$RESP" | tail -n1)
+            case "$CODIGO" in
+              401|403|404)
+                echo "A API do Render recusou a consulta (HTTP $CODIGO). Confira o secret RENDER_API_KEY."
+                exit 1 ;;
+            esac
+            STATUS=$(echo "$RESP" | sed '$d' | jq -r '.status // "indisponivel"' 2>/dev/null) || STATUS="indisponivel"
+            echo "[$i/90] status do deploy: $STATUS"
+            case "$STATUS" in
+              live) exit 0 ;;
+              build_failed|update_failed|canceled|deactivated)
+                echo "Deploy terminou com status $STATUS."; exit 1 ;;
+            esac
+            sleep 20
+          done
+          echo "Tempo esgotado esperando o deploy."; exit 1
+
+      - name: Verificar a aplicacao publicada
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "Variavel APP_URL nao configurada."; exit 1
+          fi
+          # No plano free o servico pode estar "dormindo": damos tempo para acordar.
+          for i in $(seq 1 30); do
+            CORPO=$(curl -fsS "$APP_URL/health" || true)
+            if echo "$CORPO" | jq -e '.status == "ok"' >/dev/null 2>&1; then
+              echo "Aplicacao publicada respondeu: $CORPO"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "A aplicacao publicada nao respondeu em $APP_URL/health"; exit 1
