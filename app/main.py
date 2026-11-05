@@ -32,13 +32,6 @@ app.include_router(perfil_router)
 app.include_router(sessions_router)
 app.include_router(monitor_router)
 
-if (FRONTEND_DIR / "index.html").exists():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
-else:
-    @app.get("/", tags=["infra"])
-    def raiz() -> dict:
-        return {"mensagem": "API do acessor no ar. O frontend ainda não foi criado."}
-
 @app.get("/health", tags=["infra"])
 def health() -> dict:
     problemas = validar_config()
@@ -46,3 +39,13 @@ def health() -> dict:
         "status": "ok" if not problemas else "atencao",
         "problemas_de_configuracao": problemas,
     }
+
+
+# O mount em "/" captura qualquer rota nao registrada antes dele; por isso
+# fica por ultimo, depois de /health e dos routers.
+if (FRONTEND_DIR / "index.html").exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+else:
+    @app.get("/", tags=["infra"])
+    def raiz() -> dict:
+        return {"mensagem": "API do acessor no ar. O frontend ainda não foi criado."}
